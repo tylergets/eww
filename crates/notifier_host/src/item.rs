@@ -4,6 +4,43 @@ use gtk::{self, prelude::*};
 use serde::Deserialize;
 use zbus::fdo::IntrospectableProxy;
 
+/// GTK fixes a menu window's size once it pops up, so items an app adds or relabels while the
+/// menu is open get cut off. Resize the window to fit whenever the menu's size changes.
+fn fit_while_open(menu: &gtk::Menu) {
+    let Some(window) = menu.toplevel().and_then(|w| w.downcast::<gtk::Window>().ok()) else {
+        return;
+    };
+    // The natural size last fitted, so a size the screen clamps doesn't resize forever.
+    let fitted = std::rc::Rc::new(std::cell::Cell::new((0, 0)));
+    let natural = |window: &gtk::Window| {
+        let (_, natural) = window.preferred_size();
+        (natural.width, natural.height)
+    };
+
+    let on_map = fitted.clone();
+    window.connect_map(move |window| on_map.set(natural(window)));
+    let menu = menu.downgrade();
+    window.connect_check_resize(move |window| {
+        if !window.is_visible() || natural(window) == fitted.get() {
+            return;
+        }
+        // Not from inside the resize itself.
+        let (window, menu, fitted) = (window.downgrade(), menu.clone(), fitted.clone());
+        gtk::glib::idle_add_local_once(move || {
+            let (Some(window), Some(menu)) = (window.upgrade(), menu.upgrade()) else {
+                return;
+            };
+            let size = natural(&window);
+            if !window.is_visible() || size == fitted.get() {
+                return;
+            }
+            fitted.set(size);
+            window.resize(size.0, size.1);
+            menu.reposition();
+        });
+    });
+}
+
 /// Recognised values of [`org.freedesktop.StatusNotifierItem.Status`].
 ///
 /// [`org.freedesktop.StatusNotifierItem.Status`]: https://www.freedesktop.org/wiki/Specifications/StatusNotifierItem/StatusNotifierItem/#org.freedesktop.statusnotifieritem.status
@@ -91,6 +128,7 @@ impl Item {
     pub async fn set_menu(&mut self, widget: &gtk::EventBox) -> zbus::Result<()> {
         let menu = dbusmenu_gtk3::Menu::new(self.sni.destination(), &self.sni.menu().await?);
         menu.set_attach_widget(Some(widget));
+        fit_while_open(menu.upcast_ref());
         self.gtk_menu = Some(menu);
         Ok(())
     }
